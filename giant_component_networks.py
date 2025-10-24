@@ -17,7 +17,10 @@ API = os.getenv("TRACKER_API")
 USERNAME = os.getenv("TRACKER_USERNAME")
 PASSWORD = os.getenv("TRACKER_PASSWORD")
 
-app = FastAPI(title="Giant Component - Skill Network API")
+app = FastAPI(
+    title="Giant Component - Skill Network API",
+    root_path="/giant-component-networks"
+)
 
 # === 1️⃣ Authentication Helper ===
 def get_token():
