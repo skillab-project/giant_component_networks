@@ -439,7 +439,7 @@ def ku_cooccurrence_network(
     import networkx as nx
     from pathlib import Path
 
-    BASE_URL = "https://portal.skillab-project.eu/ku-detection"
+    BASE_URL = os.getenv("KU_API_URL")
     ENDPOINT = "/analysis_results"
     api_url = f"{BASE_URL}{ENDPOINT}"
 
