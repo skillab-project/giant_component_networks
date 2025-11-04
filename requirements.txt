@@ -4,3 +4,4 @@ pandas
 networkx
 requests
 python-dotenv
+numpy
