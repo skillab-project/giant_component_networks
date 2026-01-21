@@ -1,5 +1,5 @@
 services:
-  skill-ageing:
+  giant-component-networks:
     image: ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:${DOCKER_TAG}
     build:
       context: .
