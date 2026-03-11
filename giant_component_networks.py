@@ -18,6 +18,7 @@ load_dotenv()
 API = os.getenv("TRACKER_API")
 USERNAME = os.getenv("TRACKER_USERNAME")
 PASSWORD = os.getenv("TRACKER_PASSWORD")
+BASE_URL = os.getenv("KU_API_URL")
 
 app = FastAPI(title="Giant Component - Skill Network API")
 
@@ -2180,6 +2181,7 @@ def jobs_mapped(
     except Exception as e:
         print(f"❌ ERROR in jobs_mapped_ultra: {e}")
         return {"error": str(e)}
+
 
 
 
