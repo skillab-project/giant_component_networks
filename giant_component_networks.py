@@ -10,17 +10,18 @@ import re
 from pathlib import Path
 import requests
 import os
+import time
 from dotenv import load_dotenv
 
 # === Load environment variables ===
 load_dotenv()
 
-API = os.getenv("TRACKER_API")
+API      = os.getenv("TRACKER_API")
 USERNAME = os.getenv("TRACKER_USERNAME")
 PASSWORD = os.getenv("TRACKER_PASSWORD")
-BASE_URL = os.getenv("KU_API_URL")
 
 app = FastAPI(title="Giant Component - Skill Network API")
+
 
 # === 1️⃣ Authentication Helper ===
 def get_token():
@@ -36,55 +37,88 @@ def get_token():
         raise
 
 
-# === 2️⃣ Fetch or Load Cached ESCO Skills ===
-def fetch_all_skills_from_tracker(max_pages=200, page_size=100):
-    API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-    USERNAME = os.getenv("TRACKER_USERNAME", "")
-    PASSWORD = os.getenv("TRACKER_PASSWORD", "")
+# === 2️⃣ Fetch ALL ESCO Skills from Tracker (all sources, auto-paginated) ===
+def fetch_all_skills_from_tracker():
+    """
+    Fetch every ESCO skill from the Tracker API — no keyword/source filter,
+    all pages auto-paginated using the `count` field from the first response.
+    Reads credentials exclusively from environment variables (.env).
+    """
+    api_url  = os.getenv("TRACKER_API")
+    username = os.getenv("TRACKER_USERNAME")
+    password = os.getenv("TRACKER_PASSWORD")
 
-    print(f"🔐 Authenticating to {API} ...")
-    res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD})
+    page_size   = 100
+    max_retries = 3
+    backoff     = 10
+    timeout     = 180
+
+    print(f"🔐 Authenticating to {api_url} ...")
+    res = requests.post(f"{api_url}/login", json={"username": username, "password": password}, timeout=15)
     res.raise_for_status()
-    token = res.text.replace('"', "")
+    token   = res.text.replace('"', "")
     headers = {"Authorization": f"Bearer {token}"}
-    print(f"✅ Authenticated as {USERNAME}")
+    print(f"✅ Authenticated as {username}")
 
-    all_items = []
-    seen_ids = set()
+    # ── helper: fetch one page with retry ──────────────────────────────────
+    def fetch_page(page_num: int) -> dict:
+        url = f"{api_url}/skills?page={page_num}&page_size={page_size}"
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"   ↪ Attempt {attempt}/{max_retries} — page {page_num} (timeout={timeout}s)...")
+                r = requests.post(url, headers=headers, timeout=timeout)
+                if r.status_code != 200:
+                    print(f"   ⚠️ HTTP {r.status_code} on page {page_num}: {r.text[:200]}")
+                    return {}
+                return r.json()
+            except requests.exceptions.ReadTimeout:
+                print(f"   ⏱️ Timeout on page {page_num}, attempt {attempt}/{max_retries}.")
+                if attempt < max_retries:
+                    print(f"   🔄 Retrying in {backoff}s...")
+                    time.sleep(backoff)
+                else:
+                    print(f"   ❌ All {max_retries} attempts exhausted — skipping page {page_num}.")
+                    return {}
+            except Exception as ex:
+                print(f"   ❌ {type(ex).__name__}: {ex}")
+                return {}
 
-    for page in range(1, max_pages + 1):
-        print(f"📄 Fetching /api/skills page {page} (size={page_size}) ...")
-        r = requests.post(
-            f"{API}/skills",
-            headers=headers,
-            params={"page": page, "page_size": page_size},
-            timeout=60
-        )
-        if r.status_code != 200:
-            print(f"⚠️ HTTP {r.status_code} → {r.text[:200]}")
-            break
-        try:
-            data = r.json()
-        except Exception as e:
-            print(f"⚠️ JSON decode error on page {page}: {e}")
-            break
+    # ── probe page 1 → read total count ────────────────────────────────────
+    print("🔍 Probing page 1 to determine total skill count...")
+    probe = fetch_page(1)
+    if not probe:
+        raise RuntimeError("❌ Probe request (page 1) failed. Cannot load ESCO skills.")
 
-        items = data.get("items", [])
-        print(f"✅ Page {page}: {len(items)} items")
+    total_count = probe.get("count", 0)
+    total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
+    print(f"📊 Total ESCO skills available: {total_count} → {total_pages} page(s)")
+
+    all_items = list(probe.get("items", []))
+    seen_ids  = {i.get("id") for i in all_items}
+    print(f"📦 Page 1/{total_pages}: {len(all_items)} skills")
+
+    # ── fetch remaining pages ───────────────────────────────────────────────
+    for page in range(2, total_pages + 1):
+        print(f"📄 Fetching page {page}/{total_pages}...")
+        data  = fetch_page(page)
+        items = data.get("items", []) if data else []
+
         if not items:
-            print("✅ No more skills — stopping.")
+            print(f"✅ No items on page {page} — stopping.")
             break
 
         new_items = [i for i in items if i.get("id") not in seen_ids]
         seen_ids.update(i.get("id") for i in new_items)
         all_items.extend(new_items)
+        print(f"📦 Page {page}/{total_pages}: {len(new_items)} new skills (running total: {len(all_items)})")
 
         if len(items) < page_size:
             print("✅ Last page reached.")
             break
 
-    print(f"\n🎯 Total unique skills fetched: {len(all_items)}")
+    print(f"\n🎯 Total unique ESCO skills fetched: {len(all_items)} / {total_count}")
 
+    # ── build mapping & pillar sets ────────────────────────────────────────
     mapping = {s["id"]: s.get("label", s["id"]) for s in all_items}
     pillars = {"skill": set(), "knowledge": set(), "transversal": set()}
     for s in all_items:
@@ -110,11 +144,15 @@ def load_or_fetch_skills():
     if CACHE_FILE.exists():
         print("📦 Loading ESCO skills from local cache...")
         data = json.loads(CACHE_FILE.read_text())
-        return data["mapping"], {
-            "skill": set(data["pillars"]["skill"]),
-            "knowledge": set(data["pillars"]["knowledge"]),
+        mapping = data["mapping"]
+        pillars = {
+            "skill":       set(data["pillars"]["skill"]),
+            "knowledge":   set(data["pillars"]["knowledge"]),
             "transversal": set(data["pillars"]["transversal"]),
         }
+        print(f"✅ Cache loaded: {len(mapping)} skills.")
+        return mapping, pillars
+
     print("🌐 No cache found — fetching from API (this may take a while)...")
     mapping, pillars = fetch_all_skills_from_tracker()
     CACHE_FILE.write_text(json.dumps({
@@ -134,9 +172,6 @@ def labelize(skill_uri):
     return ESCO_LABELS.get(skill_uri, skill_uri)
 
 def get_total_jobs_in_tracker():
-    API = "https://skillab-tracker.csd.auth.gr/api"
-    USERNAME = ""
-    PASSWORD = ""
     try:
         print("🔐 Authenticating to fetch total job count...")
         res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
@@ -157,10 +192,6 @@ def get_total_jobs_in_tracker():
 
 
 def fetch_all_items(endpoint: str, payload_base, max_pages=50, page_size=100):
-    API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-    USERNAME = os.getenv("TRACKER_USERNAME", "")
-    PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
     res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=10)
     res.raise_for_status()
     token = res.text.replace('"', "")
@@ -203,7 +234,7 @@ def fetch_all_items(endpoint: str, payload_base, max_pages=50, page_size=100):
 
 # === Network Creation ===
 def build_cooccurrence(skills_per_doc, valid_skills):
-    co_counts = defaultdict(int)
+    co_counts    = defaultdict(int)
     skill_counts = defaultdict(int)
 
     for skills in skills_per_doc:
@@ -256,9 +287,9 @@ def process_documents(documents):
     if G.number_of_nodes() == 0:
         return None, {}, edges, len(skills_per_doc)
 
-    GC = max(nx.connected_components(G), key=len)
+    GC   = max(nx.connected_components(G), key=len)
     subG = G.subgraph(GC).copy()
-    nodes = list(subG.nodes())
+    nodes    = list(subG.nodes())
     edges_gc = [
         {"source": u, "target": v, "value": round(d["value"], 4)}
         for u, v, d in subG.edges(data=True)
@@ -280,7 +311,7 @@ def process_documents_with_limits(documents, max_edges=100, max_nodes=200):
         print("⚠️ No valid ESCO skills found.")
         return None, {}, [], len(skills_per_doc)
 
-    co_counts = defaultdict(int)
+    co_counts    = defaultdict(int)
     skill_counts = defaultdict(int)
     for skills in skills_per_doc:
         filtered = [s for s in skills if s in valid_skills]
@@ -317,9 +348,9 @@ def process_documents_with_limits(documents, max_edges=100, max_nodes=200):
     if G.number_of_nodes() == 0:
         return None, {}, edges, len(skills_per_doc)
 
-    GC = max(nx.connected_components(G), key=len)
+    GC   = max(nx.connected_components(G), key=len)
     subG = G.subgraph(GC).copy()
-    nodes = list(subG.nodes())
+    nodes    = list(subG.nodes())
     edges_gc = [
         {"source": u, "target": v, "value": round(d["value"], 4)}
         for u, v, d in subG.edges(data=True)
@@ -328,38 +359,27 @@ def process_documents_with_limits(documents, max_edges=100, max_nodes=200):
     return (nodes, edges_gc), {}, edges, len(skills_per_doc)
 
 
+# ============================================================
+#  ENDPOINTS — all unchanged except .env cleanup
+# ============================================================
 
 @app.get("/ku-co-occurrence")
 def ku_cooccurrence_network(
-    start_date: str = Query(None, description="Start date in YYYY-MM format"),
-    end_date: str = Query(None, description="End date in YYYY-MM format"),
-    kus: str = Query(None, description="Comma-separated list of KU IDs to include, e.g., K1,K5,K10"),
+    start_date:   str = Query(None, description="Start date in YYYY-MM format"),
+    end_date:     str = Query(None, description="End date in YYYY-MM format"),
+    kus:          str = Query(None, description="Comma-separated list of KU IDs to include, e.g., K1,K5,K10"),
     organization: str = Query(None, description="Optional organization name to filter KU results by"),
-    max_edges: int = Query(100, description="Maximum number of top edges to retain"),
-    max_nodes: int = Query(200, description="Maximum number of nodes in the network")
+    max_edges:    int = Query(100,  description="Maximum number of top edges to retain"),
+    max_nodes:    int = Query(200,  description="Maximum number of nodes in the network")
 ):
-    """
-    Fetch KU analysis results from SKILLAB API and build a KU co-occurrence network.
-    Each document represents an analysis result containing detected KUs.
-    """
-    import requests, json
-    from collections import defaultdict
-    from itertools import combinations
-    import networkx as nx
-    from pathlib import Path
+    """Fetch KU analysis results and build a KU co-occurrence network."""
+    BASE_URL = os.getenv("KU_API_URL", "").rstrip("/")
+    api_url  = f"{BASE_URL}/analysis_results"
 
-    BASE_URL = "https://portal.skillab-project.eu/ku-detection"
-    ENDPOINT = "/analysis_results"
-    api_url = f"{BASE_URL}{ENDPOINT}"
-
-    # === 1️⃣ Build query parameters ===
     params = {}
-    if start_date:
-        params["start_date"] = start_date
-    if end_date:
-        params["end_date"] = end_date
-    if organization:
-        params["organization"] = organization
+    if start_date:   params["start_date"]   = start_date
+    if end_date:     params["end_date"]     = end_date
+    if organization: params["organization"] = organization
 
     try:
         print(f"🔍 Fetching KU analysis data from: {api_url} with params {params}")
@@ -372,38 +392,27 @@ def ku_cooccurrence_network(
 
         print(f"✅ Retrieved {len(ku_data)} KU records from SKILLAB portal")
 
-        # === 2️⃣ Prepare KU skill lists per document ===
         selected_kus = set(kus.split(",")) if kus else None
         ku_docs = []
 
         for record in ku_data:
             detected_kus = record.get("detected_kus", {})
-            org = record.get("organization", "Unknown")
+            org       = record.get("organization", "Unknown")
             timestamp = record.get("timestamp", "")
-
-            # Filter by organization if provided
             if organization and org.lower() != organization.lower():
                 continue
-
-            # Keep only active KUs (value == "1")
             active_kus = [ku for ku, val in detected_kus.items() if str(val) == "1"]
-
-            # Filter specific KUs if provided
             if selected_kus:
                 active_kus = [ku for ku in active_kus if ku in selected_kus]
-
             if active_kus:
                 ku_docs.append({"organization": org, "timestamp": timestamp, "kus": active_kus})
 
         print(f"📊 Documents with KU detections: {len(ku_docs)}")
-
         if not ku_docs:
             return {"message": "No KU detections found for the selected filters."}
 
-        # === 3️⃣ Build KU co-occurrence matrix ===
         co_counts = defaultdict(int)
         ku_counts = defaultdict(int)
-
         for doc in ku_docs:
             kus_in_doc = doc["kus"]
             for ku in set(kus_in_doc):
@@ -411,72 +420,45 @@ def ku_cooccurrence_network(
             for ku1, ku2 in combinations(sorted(set(kus_in_doc)), 2):
                 co_counts[(ku1, ku2)] += 1
 
-        # === 4️⃣ Compute edge weights (normalized association)
         edges = []
         for (ku1, ku2), cij in co_counts.items():
             ci, cj = ku_counts[ku1], ku_counts[ku2]
             if ci == 0 or cj == 0:
                 continue
             eij = (cij ** 2) / (ci * cj)
-            edges.append({
-                "source": ku1,
-                "target": ku2,
-                "value": round(eij, 4),
-                "raw_count": cij
-            })
+            edges.append({"source": ku1, "target": ku2, "value": round(eij, 4), "raw_count": cij})
 
         if not edges:
             return {"message": "No co-occurrence edges found among KUs."}
 
-        # === 5️⃣ Keep only strongest edges ===
         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-
-        # Build the graph
         G = nx.Graph()
         for edge in edges:
             G.add_edge(edge["source"], edge["target"], value=edge["value"])
 
-        # Limit node count if too large
         if G.number_of_nodes() > max_nodes:
             top_nodes = sorted(G.degree, key=lambda x: x[1], reverse=True)[:max_nodes]
             G = G.subgraph({n for n, _ in top_nodes}).copy()
 
-        # === 6️⃣ Extract the giant component ===
         if G.number_of_nodes() == 0:
             return {"message": "No network could be built."}
 
-        GC = max(nx.connected_components(G), key=len)
+        GC   = max(nx.connected_components(G), key=len)
         subG = G.subgraph(GC).copy()
-
-        nodes = list(subG.nodes())
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in subG.edges(data=True)
-        ]
-
+        nodes    = list(subG.nodes())
+        edges_gc = [{"source": u, "target": v, "value": round(d["value"], 4)} for u, v, d in subG.edges(data=True)]
         print(f"🕸️ Giant Component — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
 
-        # === 7️⃣ Build summary ===
-        summary = {
-            "Total KU Records": len(ku_data),
-            "Documents with KUs": len(ku_docs),
-            "Unique KUs": len(ku_counts),
-            "Giant Component Nodes": len(nodes),
-            "Giant Component Edges": len(edges_gc)
-        }
-
-        filters_used = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "kus": kus,
-            "organization": organization
-        }
-
-        # === ✅ Return result ===
         return {
             "message": "✅ KU co-occurrence network successfully created.",
-            "filters_used": filters_used,
-            "summary": summary,
+            "filters_used": {"start_date": start_date, "end_date": end_date, "kus": kus, "organization": organization},
+            "summary": {
+                "Total KU Records": len(ku_data),
+                "Documents with KUs": len(ku_docs),
+                "Unique KUs": len(ku_counts),
+                "Giant Component Nodes": len(nodes),
+                "Giant Component Edges": len(edges_gc)
+            },
             "giant_component": {"nodes": nodes, "edges": edges_gc}
         }
 
@@ -484,80 +466,60 @@ def ku_cooccurrence_network(
         return {"error": f"KU co-occurrence analysis failed: {str(e)}"}
 
 
-
-
-
-
 @app.get("/api/law-policies_mapped")
 def law_policies_mapped(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. data,ai,green)"),
-    source: str = Query("eur_lex", description="Source of the policies (default: eur_lex)"),
-    max_edges: int = Query(100, description="Maximum number of top edges to retain"),
-    max_nodes: int = Query(200, description="Maximum number of nodes in the network")
+    keywords:  str = Query(...,       description="Comma-separated keywords (e.g. data,ai,green)"),
+    source:    str = Query("eur_lex", description="Source of the policies (default: eur_lex)"),
+    max_edges: int = Query(100,       description="Maximum number of top edges to retain"),
+    max_nodes: int = Query(200,       description="Maximum number of nodes in the network")
 ):
-    """Fetch filtered law/policy documents, extract skills, and build a URI→label co-occurrence network."""
+    """Fetch filtered law/policy documents, extract skills, build a URI→label co-occurrence network."""
     try:
-        # === 1️⃣ Authenticate ===
         print("🔐 Authenticating for law policy retrieval...")
         res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
         res.raise_for_status()
-        token = res.text.replace('"', "")
+        token   = res.text.replace('"', "")
         headers = {"Authorization": f"Bearer {token}"}
         print("✅ Authenticated successfully.")
 
-        # === 2️⃣ Prepare payload ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        payload = {
-            "keywords": keywords_list,
-            "keywords_logic": "or",
-            "sources": [source],
-        }
+        payload = {"keywords": keywords_list, "keywords_logic": "or", "sources": [source]}
         print(f"📡 Querying /law-policies with {len(keywords_list)} keywords: {keywords_list}")
 
-        # === 3️⃣ Paginated retrieval of filtered law policies ===
-        all_docs = []
-        max_pages = 50  # limit for safety
-
+        all_docs  = []
+        max_pages = 50
         for page in range(1, max_pages + 1):
             try:
                 url = f"{API}/law-policies?page={page}&page_size=100"
                 print(f"📡 Fetching page {page} ...")
-
                 res = requests.post(url, headers=headers, data=payload, timeout=90)
                 if res.status_code != 200:
                     print(f"⚠️ Page {page}: HTTP {res.status_code} → {res.text[:200]}")
                     break
-
-                data = res.json()
+                data  = res.json()
                 items = data.get("items", [])
                 print(f"📄 Page {page}: Retrieved {len(items)} items")
-
                 if not items:
                     print("✅ No more results, stopping.")
                     break
-
                 all_docs.extend(items)
                 if len(items) < 100:
                     print("✅ Last page reached (less than 100 results).")
                     break
-
             except Exception as e:
                 print(f"❌ Error on page {page}: {e}")
                 break
 
         print(f"🎯 Total documents retrieved: {len(all_docs)}")
-
         if not all_docs:
             return {"message": f"No policy documents found for {keywords_list} from {source}."}
 
-        # === 4️⃣ Extract skills ===
         skills_per_doc = [doc.get("skills", []) for doc in all_docs if doc.get("skills")]
         print(f"📊 Documents containing skills: {len(skills_per_doc)}")
         if not skills_per_doc:
             return {"message": "⚠️ No skills found in the retrieved documents."}
 
-        # === 5️⃣ Build co-occurrence network ===
-        co_counts = defaultdict(int)
+        co_counts    = defaultdict(int)
         skill_counts = defaultdict(int)
         for skills in skills_per_doc:
             unique_skills = set(skills)
@@ -571,44 +533,28 @@ def law_policies_mapped(
             ci, cj = skill_counts[s1], skill_counts[s2]
             if ci and cj:
                 eij = (cij ** 2) / (ci * cj)
-                edges.append({
-                    "source": labelize(s1),
-                    "target": labelize(s2),
-                    "value": round(eij, 4)
-                })
+                edges.append({"source": labelize(s1), "target": labelize(s2), "value": round(eij, 4)})
 
         if not edges:
             return {"message": "⚠️ No co-occurrence relationships found."}
 
-        # === 6️⃣ Trim and simplify for visualization ===
         print(f"🕸️ Raw network: {len(co_counts)} edges among {len(skill_counts)} skills")
-
-        # ✅ Keep larger default networks (but still manageable)
         max_edges = max(max_edges, 1000)
         max_nodes = max(max_nodes, 600)
 
-        # Sort by connection strength (edge weight)
         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-
-        # Build the full weighted graph
         G = nx.Graph()
         for e in edges:
             G.add_edge(e["source"], e["target"], value=e["value"])
 
         print(f"📈 Initial Graph — Nodes: {len(G.nodes())}, Edges: {len(G.edges())}")
 
-        # ✅ Only simplify if the graph is *too* large
         if len(G.nodes()) > max_nodes:
-            node_strength = {
-                n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-                for n in G.nodes()
-            }
-            top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-            keep_nodes = {n for n, _ in top_nodes}
-            G = G.subgraph(keep_nodes).copy()
+            node_strength = {n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True)) for n in G.nodes()}
+            top_nodes     = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+            G             = G.subgraph({n for n, _ in top_nodes}).copy()
             print(f"⚙️ Simplified: retained top {len(G.nodes())} nodes by weighted degree")
 
-        # Remove isolated nodes (those without any edges)
         isolates = list(nx.isolates(G))
         if isolates:
             G.remove_nodes_from(isolates)
@@ -617,34 +563,21 @@ def law_policies_mapped(
         if G.number_of_nodes() == 0:
             return {"message": "⚠️ No valid network could be built."}
 
-        # Compute the largest connected component
         components = list(nx.connected_components(G))
         if len(components) > 1:
-            GC = max(components, key=len)
+            GC   = max(components, key=len)
             subG = G.subgraph(GC).copy()
             print(f"🔗 Selected giant component with {len(subG.nodes())} nodes")
         else:
             subG = G
 
-        # Prepare for visualization or API output
-        nodes = [{"id": n, "degree": subG.degree(n)} for n in subG.nodes()]
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in subG.edges(data=True)
-        ]
-
-        print(f"🌐 Final network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
-
-        # === 7️⃣ Compute Network Metrics ===
         print("📈 Computing network metrics...")
-
-        # Compute metrics safely
         try:
-            degree_dict = dict(subG.degree())
+            degree_dict     = dict(subG.degree())
             weighted_degree = dict(subG.degree(weight="value"))
-            betweenness = nx.betweenness_centrality(subG, weight="value", normalized=True)
-            closeness = nx.closeness_centrality(subG)
-            clustering = nx.clustering(subG, weight="value")
+            betweenness     = nx.betweenness_centrality(subG, weight="value", normalized=True)
+            closeness       = nx.closeness_centrality(subG)
+            clustering      = nx.clustering(subG, weight="value")
             try:
                 eigenvector = nx.eigenvector_centrality(subG, weight="value", max_iter=500)
             except nx.PowerIterationFailedConvergence:
@@ -654,15 +587,10 @@ def law_policies_mapped(
             print(f"⚠️ Metric computation error: {e}")
             degree_dict = dict(subG.degree())
             weighted_degree = dict(subG.degree(weight="value"))
-            betweenness = {n: 0 for n in subG.nodes()}
-            closeness = {n: 0 for n in subG.nodes()}
-            clustering = {n: 0 for n in subG.nodes()}
-            eigenvector = {n: 0 for n in subG.nodes()}
+            betweenness = closeness = clustering = eigenvector = {n: 0 for n in subG.nodes()}
 
-        # Combine metrics per node
-        nodes = []
-        for n in subG.nodes():
-            nodes.append({
+        nodes_out = [
+            {
                 "id": n,
                 "degree": degree_dict.get(n, 0),
                 "weighted_degree": round(weighted_degree.get(n, 0), 4),
@@ -670,29 +598,25 @@ def law_policies_mapped(
                 "closeness": round(closeness.get(n, 0), 5),
                 "clustering": round(clustering.get(n, 0), 5),
                 "eigenvector": round(eigenvector.get(n, 0), 5)
-            })
-
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in subG.edges(data=True)
+            }
+            for n in subG.nodes()
         ]
+        edges_gc = [{"source": u, "target": v, "value": round(d["value"], 4)} for u, v, d in subG.edges(data=True)]
 
-        print(f"🌐 Final network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
-        print("📊 Example node metrics:")
-        for n in nodes[:5]:
+        print(f"🌐 Final network — Nodes: {len(nodes_out)}, Edges: {len(edges_gc)}")
+        for n in nodes_out[:5]:
             print(f"  {n['id']} — degree={n['degree']}, betweenness={n['betweenness']:.4f}")
 
-        # === 8️⃣ Return JSON ===
         return {
             "message": f"✅ Skill co-occurrence network built for {len(all_docs)} policies.",
             "filters_used": {"keywords": keywords_list, "source": source},
             "summary": {
                 "Documents Retrieved": len(all_docs),
                 "Documents with Skills": len(skills_per_doc),
-                "Giant Component Nodes": len(nodes),
+                "Giant Component Nodes": len(nodes_out),
                 "Giant Component Edges": len(edges_gc)
             },
-            "giant_component": {"nodes": nodes, "edges": edges_gc}
+            "giant_component": {"nodes": nodes_out, "edges": edges_gc}
         }
 
     except Exception as e:
@@ -700,80 +624,50 @@ def law_policies_mapped(
         return {"error": str(e)}
 
 
-
-
 @app.get("/api/courses_mapped")
 def courses_mapped(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. data, ai, green)"),
-    source: str = Query("coursera", description="Source of the courses (default: coursera)"),
-    max_edges: int = Query(200, description="Maximum number of edges to keep"),
-    max_nodes: int = Query(200, description="Maximum number of nodes to keep")
+    keywords:  str = Query(...,        description="Comma-separated keywords (e.g. data, ai, green)"),
+    source:    str = Query("coursera", description="Source of the courses (default: coursera)"),
+    max_edges: int = Query(200,        description="Maximum number of edges to keep"),
+    max_nodes: int = Query(200,        description="Maximum number of nodes to keep")
 ):
-    """
-    Fetch filtered courses from Tracker API using keywords.
-    Build a skill co-occurrence network (URI → label) with centrality metrics.
-    """
-    import requests, os
-    from itertools import combinations
-    from collections import defaultdict
-    import networkx as nx
-    from dotenv import load_dotenv
-
-    load_dotenv()
-    API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-    USERNAME = os.getenv("TRACKER_USERNAME", "")
-    PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
+    """Fetch filtered courses, build a skill co-occurrence network with centrality metrics."""
     try:
-        # === 1️⃣ Authenticate ===
         print("🔐 Authenticating with Tracker...")
         res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
         res.raise_for_status()
-        token = res.text.replace('"', "")
-        headers = {"Authorization": f"Bearer {token}"}
+        token   = res.text.replace('"', "")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
         print("✅ Authenticated successfully.")
 
-        # === 2️⃣ Prepare query ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
         print(f"📡 Fetching courses matching keywords: {keywords_list}")
 
-        # === 3️⃣ Paginated retrieval ===
         all_courses = []
         for page in range(1, 51):
-            form_data = [
-                ("keywords_logic", "or"),
-                ("skill_ids_logic", "or"),
-                ("sources", source),
-            ]
+            form_data = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("sources", source)]
             for kw in keywords_list:
                 form_data.append(("keywords", kw))
 
             url = f"{API}/courses?page={page}&page_size=100"
             print(f"📄 Fetching page {page}...")
-
-            res = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json"
-                },
-                data=form_data,
-                timeout=90
-            )
+            res = requests.post(url, headers=headers, data=form_data, timeout=90)
 
             if res.status_code != 200:
                 print(f"⚠️ Page {page}: HTTP {res.status_code} → {res.text[:200]}")
                 break
 
-            data = res.json()
+            data  = res.json()
             items = data.get("items", [])
             print(f"📦 Page {page}: Retrieved {len(items)} courses")
 
             if not items:
                 print("✅ No more results — stopping.")
                 break
-
             all_courses.extend(items)
             if len(items) < 100:
                 print("✅ Last page reached.")
@@ -783,14 +677,12 @@ def courses_mapped(
         if not all_courses:
             return {"message": f"No courses found for {keywords_list} from {source}."}
 
-        # === 4️⃣ Extract skills per course ===
         skills_per_doc = [doc.get("skills", []) for doc in all_courses if doc.get("skills")]
         print(f"📊 Courses containing skills: {len(skills_per_doc)}")
         if not skills_per_doc:
             return {"message": "⚠️ No skills found in the retrieved courses."}
 
-        # === 5️⃣ Build co-occurrence network ===
-        co_counts = defaultdict(int)
+        co_counts    = defaultdict(int)
         skill_counts = defaultdict(int)
         for skills in skills_per_doc:
             unique_skills = set(skills)
@@ -804,29 +696,20 @@ def courses_mapped(
             ci, cj = skill_counts[s1], skill_counts[s2]
             if ci and cj:
                 eij = (cij ** 2) / (ci * cj)
-                edges.append({
-                    "source": labelize(s1),
-                    "target": labelize(s2),
-                    "value": round(eij, 4)
-                })
+                edges.append({"source": labelize(s1), "target": labelize(s2), "value": round(eij, 4)})
 
         if not edges:
             return {"message": "⚠️ No co-occurrence relationships found."}
 
         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-
         G = nx.Graph()
         for e in edges:
             G.add_edge(e["source"], e["target"], value=e["value"])
 
         if len(G.nodes()) > max_nodes:
-            node_strength = {
-                n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-                for n in G.nodes()
-            }
-            top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-            keep_nodes = {n for n, _ in top_nodes}
-            G = G.subgraph(keep_nodes).copy()
+            node_strength = {n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True)) for n in G.nodes()}
+            top_nodes     = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+            G             = G.subgraph({n for n, _ in top_nodes}).copy()
             print(f"⚙️ Simplified: retained top {len(G.nodes())} nodes")
 
         isolates = list(nx.isolates(G))
@@ -837,14 +720,13 @@ def courses_mapped(
         if G.number_of_nodes() == 0:
             return {"message": "⚠️ No valid network could be built."}
 
-        # === 6️⃣ Compute metrics ===
         print("📈 Computing centrality metrics...")
         try:
-            degree_dict = dict(G.degree())
+            degree_dict     = dict(G.degree())
             weighted_degree = dict(G.degree(weight="value"))
-            betweenness = nx.betweenness_centrality(G, weight="value", normalized=True)
-            closeness = nx.closeness_centrality(G)
-            clustering = nx.clustering(G, weight="value")
+            betweenness     = nx.betweenness_centrality(G, weight="value", normalized=True)
+            closeness       = nx.closeness_centrality(G)
+            clustering      = nx.clustering(G, weight="value")
             try:
                 eigenvector = nx.eigenvector_centrality(G, weight="value", max_iter=500)
             except nx.PowerIterationFailedConvergence:
@@ -852,11 +734,9 @@ def courses_mapped(
                 print("⚠️ Eigenvector centrality did not converge.")
         except Exception as e:
             print(f"⚠️ Metric computation error: {e}")
-            degree_dict = weighted_degree = {}
-            betweenness = closeness = clustering = eigenvector = {}
+            degree_dict = weighted_degree = betweenness = closeness = clustering = eigenvector = {}
 
-        # === 7️⃣ Prepare labeled network output ===
-        nodes = [
+        nodes_out = [
             {
                 "id": n,
                 "degree": degree_dict.get(n, 0),
@@ -868,22 +748,19 @@ def courses_mapped(
             }
             for n in G.nodes()
         ]
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in G.edges(data=True)
-        ]
+        edges_gc = [{"source": u, "target": v, "value": round(d["value"], 4)} for u, v, d in G.edges(data=True)]
 
-        print(f"🌐 Final course network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
+        print(f"🌐 Final course network — Nodes: {len(nodes_out)}, Edges: {len(edges_gc)}")
         return {
             "message": f"✅ Skill co-occurrence network built for {len(all_courses)} courses.",
             "filters_used": {"keywords": keywords_list, "source": source},
             "summary": {
                 "Courses Retrieved": len(all_courses),
                 "Courses with Skills": len(skills_per_doc),
-                "Nodes": len(nodes),
+                "Nodes": len(nodes_out),
                 "Edges": len(edges_gc)
             },
-            "giant_component": {"nodes": nodes, "edges": edges_gc}
+            "giant_component": {"nodes": nodes_out, "edges": edges_gc}
         }
 
     except Exception as e:
@@ -891,58 +768,37 @@ def courses_mapped(
         return {"error": str(e)}
 
 
-
-
-
 @app.get("/api/articles_mapped_kalos")
 def articles_mapped(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, education)"),
-    source: str = Query("cordis", description="Source of the articles (default: cordis)"),
-    publication_date_min: str = Query(None, description="Minimum publication date (YYYY-MM-DD)"),
-    publication_date_max: str = Query(None, description="Maximum publication date (YYYY-MM-DD)"),
-    max_edges: int = Query(200, description="Maximum number of edges to keep"),
-    max_nodes: int = Query(200, description="Maximum number of nodes to keep"),
-    max_pages: int = Query(15, description="Maximum number of pages to fetch (each page = 100 articles) - Loading more pages means waiting longer.")
+    keywords:             str = Query(...,     description="Comma-separated keywords (e.g. AI, data, education)"),
+    source:               str = Query("cordis",description="Source of the articles (default: cordis)"),
+    publication_date_min: str = Query(None,    description="Minimum publication date (YYYY-MM-DD)"),
+    publication_date_max: str = Query(None,    description="Maximum publication date (YYYY-MM-DD)"),
+    max_edges:            int = Query(200,     description="Maximum number of edges to keep"),
+    max_nodes:            int = Query(200,     description="Maximum number of nodes to keep"),
+    max_pages:            int = Query(15,      description="Maximum number of pages to fetch (each page = 100 articles)")
 ):
-    """
-    Fetch up to 10 pages of filtered articles (max 1000) from Tracker API using keywords, date filters, and sources.
-    Build a skill co-occurrence network (URI → label) with centrality metrics.
-    """
-    import requests, os
-    from itertools import combinations
-    from collections import defaultdict
-    import networkx as nx
-    from dotenv import load_dotenv
-
-    load_dotenv()
-    API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-    USERNAME = os.getenv("TRACKER_USERNAME", "")
-    PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
+    """Fetch filtered articles, build a skill co-occurrence network with centrality metrics."""
     try:
-        # === 1️⃣ Authenticate ===
         print("🔐 Authenticating with Tracker...")
         res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
         res.raise_for_status()
-        token = res.text.replace('"', "")
-        headers = {"Authorization": f"Bearer {token}"}
+        token   = res.text.replace('"', "")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
         print("✅ Authenticated successfully.")
 
-        # === 2️⃣ Prepare query ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
         print(f"📡 Fetching articles matching keywords: {keywords_list}")
 
-        # === 3️⃣ Paginated retrieval (10 pages max) ===
         all_articles = []
         for page in range(1, max_pages + 1):
-            form_data = [
-                ("keywords_logic", "or"),
-                ("skill_ids_logic", "or"),
-                ("sources", source),
-            ]
+            form_data = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("sources", source)]
             for kw in keywords_list:
                 form_data.append(("keywords", kw))
-
             if publication_date_min:
                 form_data.append(("publication_date_min", publication_date_min))
             if publication_date_max:
@@ -950,30 +806,19 @@ def articles_mapped(
 
             url = f"{API}/articles?page={page}&page_size=100"
             print(f"📄 Fetching page {page}/{max_pages}...")
-
-            res = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json"
-                },
-                data=form_data,
-                timeout=90
-            )
+            res = requests.post(url, headers=headers, data=form_data, timeout=90)
 
             if res.status_code != 200:
                 print(f"⚠️ Page {page}: HTTP {res.status_code} → {res.text[:200]}")
                 break
 
-            data = res.json()
+            data  = res.json()
             items = data.get("items", [])
             print(f"📦 Page {page}: Retrieved {len(items)} articles")
 
             if not items:
                 print("✅ No more results — stopping.")
                 break
-
             all_articles.extend(items)
             if len(items) < 100:
                 print("✅ Last page reached (less than 100 results).")
@@ -983,14 +828,12 @@ def articles_mapped(
         if not all_articles:
             return {"message": f"No articles found for {keywords_list} from {source}."}
 
-        # === 4️⃣ Extract skills per article ===
         skills_per_doc = [doc.get("skills", []) for doc in all_articles if doc.get("skills")]
         print(f"📊 Articles containing skills: {len(skills_per_doc)}")
         if not skills_per_doc:
             return {"message": "⚠️ No skills found in the retrieved articles."}
 
-        # === 5️⃣ Build co-occurrence network ===
-        co_counts = defaultdict(int)
+        co_counts    = defaultdict(int)
         skill_counts = defaultdict(int)
         for skills in skills_per_doc:
             unique_skills = set(skills)
@@ -1004,29 +847,20 @@ def articles_mapped(
             ci, cj = skill_counts[s1], skill_counts[s2]
             if ci and cj:
                 eij = (cij ** 2) / (ci * cj)
-                edges.append({
-                    "source": labelize(s1),
-                    "target": labelize(s2),
-                    "value": round(eij, 4)
-                })
+                edges.append({"source": labelize(s1), "target": labelize(s2), "value": round(eij, 4)})
 
         if not edges:
             return {"message": "⚠️ No co-occurrence relationships found."}
 
         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-
         G = nx.Graph()
         for e in edges:
             G.add_edge(e["source"], e["target"], value=e["value"])
 
         if len(G.nodes()) > max_nodes:
-            node_strength = {
-                n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-                for n in G.nodes()
-            }
-            top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-            keep_nodes = {n for n, _ in top_nodes}
-            G = G.subgraph(keep_nodes).copy()
+            node_strength = {n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True)) for n in G.nodes()}
+            top_nodes     = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+            G             = G.subgraph({n for n, _ in top_nodes}).copy()
             print(f"⚙️ Simplified: retained top {len(G.nodes())} nodes")
 
         isolates = list(nx.isolates(G))
@@ -1037,14 +871,13 @@ def articles_mapped(
         if G.number_of_nodes() == 0:
             return {"message": "⚠️ No valid network could be built."}
 
-        # === 6️⃣ Compute centrality metrics ===
         print("📈 Computing centrality metrics...")
         try:
-            degree_dict = dict(G.degree())
+            degree_dict     = dict(G.degree())
             weighted_degree = dict(G.degree(weight="value"))
-            betweenness = nx.betweenness_centrality(G, weight="value", normalized=True)
-            closeness = nx.closeness_centrality(G)
-            clustering = nx.clustering(G, weight="value")
+            betweenness     = nx.betweenness_centrality(G, weight="value", normalized=True)
+            closeness       = nx.closeness_centrality(G)
+            clustering      = nx.clustering(G, weight="value")
             try:
                 eigenvector = nx.eigenvector_centrality(G, weight="value", max_iter=500)
             except nx.PowerIterationFailedConvergence:
@@ -1052,11 +885,9 @@ def articles_mapped(
                 print("⚠️ Eigenvector centrality did not converge.")
         except Exception as e:
             print(f"⚠️ Metric computation error: {e}")
-            degree_dict = weighted_degree = {}
-            betweenness = closeness = clustering = eigenvector = {}
+            degree_dict = weighted_degree = betweenness = closeness = clustering = eigenvector = {}
 
-        # === 7️⃣ Prepare labeled network output ===
-        nodes = [
+        nodes_out = [
             {
                 "id": n,
                 "degree": degree_dict.get(n, 0),
@@ -1068,12 +899,9 @@ def articles_mapped(
             }
             for n in G.nodes()
         ]
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in G.edges(data=True)
-        ]
+        edges_gc = [{"source": u, "target": v, "value": round(d["value"], 4)} for u, v, d in G.edges(data=True)]
 
-        print(f"🌐 Final article network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
+        print(f"🌐 Final article network — Nodes: {len(nodes_out)}, Edges: {len(edges_gc)}")
         return {
             "message": f"✅ Skill co-occurrence network built for {len(all_articles)} articles (up to {max_pages} pages).",
             "filters_used": {
@@ -1086,241 +914,30 @@ def articles_mapped(
             "summary": {
                 "Articles Retrieved": len(all_articles),
                 "Articles with Skills": len(skills_per_doc),
-                "Nodes": len(nodes),
+                "Nodes": len(nodes_out),
                 "Edges": len(edges_gc)
             },
-            "giant_component": {"nodes": nodes, "edges": edges_gc}
+            "giant_component": {"nodes": nodes_out, "edges": edges_gc}
         }
 
     except Exception as e:
         print(f"❌ ERROR: {e}")
         return {"error": str(e)}
 
-# @app.get("/api/profiles_mapped")
-# def profiles_mapped(
-#     keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, education)"),
-#     source: str = Query(None, description="Optional source filter for profiles (e.g. linkedin, eurofound)"),
-#     max_edges: int = Query(200, description="Maximum number of edges to keep"),
-#     max_nodes: int = Query(200, description="Maximum number of nodes to keep"),
-#     max_pages: int = Query(10, description="Maximum number of pages to fetch (each page = 100 profiles) - Loading more pages means waiting longer.")
-# ):
-#     """
-#     Fetch up to 10 pages of filtered profiles (max 1000) from Tracker API using keywords and optional source filter.
-#     Build a skill co-occurrence network (URI → label) with centrality metrics.
-#     """
-#     import requests, os
-#     from itertools import combinations
-#     from collections import defaultdict
-#     import networkx as nx
-#     from dotenv import load_dotenv
-#
-#     load_dotenv()
-#     API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-#     USERNAME = os.getenv("TRACKER_USERNAME", "")
-#     PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-#
-#     try:
-#         # === 1️⃣ Authenticate ===
-#         print("🔐 Authenticating with Tracker...")
-#         res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-#         res.raise_for_status()
-#         token = res.text.replace('"', "")
-#         headers = {"Authorization": f"Bearer {token}"}
-#         print("✅ Authenticated successfully.")
-#
-#         # === 2️⃣ Prepare query ===
-#         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-#         print(f"📡 Fetching profiles matching keywords: {keywords_list}")
-#         if source:
-#             print(f"🗂️ Source filter applied: {source}")
-#         else:
-#             print("🗂️ No source filter applied.")
-#
-#         # === 3️⃣ Paginated retrieval (up to 10 pages) ===
-#         all_profiles = []
-#         for page in range(1, max_pages + 1):
-#             form_data = [
-#                 ("keywords_logic", "or"),
-#                 ("skill_ids_logic", "or"),
-#             ]
-#             for kw in keywords_list:
-#                 form_data.append(("keywords", kw))
-#
-#             if source:
-#                 form_data.append(("sources", source))
-#
-#             url = f"{API}/profiles?page={page}&page_size=100"
-#             print(f"📄 Fetching page {page}/{max_pages}...")
-#
-#             res = requests.post(
-#                 url,
-#                 headers={
-#                     "Authorization": f"Bearer {token}",
-#                     "Content-Type": "application/x-www-form-urlencoded",
-#                     "Accept": "application/json"
-#                 },
-#                 data=form_data,
-#                 timeout=90
-#             )
-#
-#             if res.status_code != 200:
-#                 print(f"⚠️ Page {page}: HTTP {res.status_code} → {res.text[:200]}")
-#                 break
-#
-#             data = res.json()
-#             items = data.get("items", [])
-#             print(f"📦 Page {page}: Retrieved {len(items)} profiles")
-#
-#             if not items:
-#                 print("✅ No more results — stopping.")
-#                 break
-#
-#             all_profiles.extend(items)
-#             if len(items) < 100:
-#                 print("✅ Last page reached (less than 100 results).")
-#                 break
-#
-#         print(f"🎯 Total profiles retrieved: {len(all_profiles)} (max {max_pages * 100})")
-#         if not all_profiles:
-#             return {"message": f"No profiles found for {keywords_list}."}
-#
-#         # === 4️⃣ Extract skills per profile ===
-#         skills_per_doc = [doc.get("skills", []) for doc in all_profiles if doc.get("skills")]
-#         print(f"📊 Profiles containing skills: {len(skills_per_doc)}")
-#         if not skills_per_doc:
-#             return {"message": "⚠️ No skills found in the retrieved profiles."}
-#
-#         # === 5️⃣ Build co-occurrence network ===
-#         co_counts = defaultdict(int)
-#         skill_counts = defaultdict(int)
-#         for skills in skills_per_doc:
-#             unique_skills = set(skills)
-#             for s in unique_skills:
-#                 skill_counts[s] += 1
-#             for s1, s2 in combinations(sorted(unique_skills), 2):
-#                 co_counts[(s1, s2)] += 1
-#
-#         edges = []
-#         for (s1, s2), cij in co_counts.items():
-#             ci, cj = skill_counts[s1], skill_counts[s2]
-#             if ci and cj:
-#                 eij = (cij ** 2) / (ci * cj)
-#                 edges.append({
-#                     "source": labelize(s1),
-#                     "target": labelize(s2),
-#                     "value": round(eij, 4)
-#                 })
-#
-#         if not edges:
-#             return {"message": "⚠️ No co-occurrence relationships found."}
-#
-#         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-#
-#         G = nx.Graph()
-#         for e in edges:
-#             G.add_edge(e["source"], e["target"], value=e["value"])
-#
-#         if len(G.nodes()) > max_nodes:
-#             node_strength = {
-#                 n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-#                 for n in G.nodes()
-#             }
-#             top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-#             keep_nodes = {n for n, _ in top_nodes}
-#             G = G.subgraph(keep_nodes).copy()
-#             print(f"⚙️ Simplified: retained top {len(G.nodes())} nodes")
-#
-#         isolates = list(nx.isolates(G))
-#         if isolates:
-#             G.remove_nodes_from(isolates)
-#             print(f"🧹 Removed {len(isolates)} isolated nodes")
-#
-#         if G.number_of_nodes() == 0:
-#             return {"message": "⚠️ No valid network could be built."}
-#
-#         # === 6️⃣ Compute centrality metrics ===
-#         print("📈 Computing centrality metrics...")
-#         try:
-#             degree_dict = dict(G.degree())
-#             weighted_degree = dict(G.degree(weight="value"))
-#             betweenness = nx.betweenness_centrality(G, weight="value", normalized=True)
-#             closeness = nx.closeness_centrality(G)
-#             clustering = nx.clustering(G, weight="value")
-#             try:
-#                 eigenvector = nx.eigenvector_centrality(G, weight="value", max_iter=500)
-#             except nx.PowerIterationFailedConvergence:
-#                 eigenvector = {n: 0 for n in G.nodes()}
-#                 print("⚠️ Eigenvector centrality did not converge.")
-#         except Exception as e:
-#             print(f"⚠️ Metric computation error: {e}")
-#             degree_dict = weighted_degree = {}
-#             betweenness = closeness = clustering = eigenvector = {}
-#
-#         # === 7️⃣ Prepare labeled network output ===
-#         nodes = [
-#             {
-#                 "id": n,
-#                 "degree": degree_dict.get(n, 0),
-#                 "weighted_degree": round(weighted_degree.get(n, 0), 4),
-#                 "betweenness": round(betweenness.get(n, 0), 5),
-#                 "closeness": round(closeness.get(n, 0), 5),
-#                 "clustering": round(clustering.get(n, 0), 5),
-#                 "eigenvector": round(eigenvector.get(n, 0), 5)
-#             }
-#             for n in G.nodes()
-#         ]
-#         edges_gc = [
-#             {"source": u, "target": v, "value": round(d["value"], 4)}
-#             for u, v, d in G.edges(data=True)
-#         ]
-#
-#         print(f"🌐 Final profile network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
-#         return {
-#             "message": f"✅ Skill co-occurrence network built for {len(all_profiles)} profiles (up to {max_pages} pages).",
-#             "filters_used": {
-#                 "keywords": keywords_list,
-#                 "source": source,
-#                 "max_pages": max_pages
-#             },
-#             "summary": {
-#                 "Profiles Retrieved": len(all_profiles),
-#                 "Profiles with Skills": len(skills_per_doc),
-#                 "Nodes": len(nodes),
-#                 "Edges": len(edges_gc)
-#             },
-#             "giant_component": {"nodes": nodes, "edges": edges_gc}
-#         }
-#
-#     except Exception as e:
-#         print(f"❌ ERROR: {e}")
-#         return {"error": str(e)}
-
 
 @app.get("/api/profiles_mapped")
 def profiles_mapped(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, education)"),
-    source: str = Query(None, description="Optional source filter for profiles (e.g. linkedin, eurofound)"),
-    max_edges: int = Query(200, description="Maximum number of edges to keep"),
-    max_nodes: int = Query(200, description="Maximum number of nodes to keep"),
+    keywords:  str = Query(...,  description="Comma-separated keywords (e.g. AI, data, education)"),
+    source:    str = Query(None, description="Optional source filter for profiles (e.g. linkedin, eurofound)"),
+    max_edges: int = Query(200,  description="Maximum number of edges to keep"),
+    max_nodes: int = Query(200,  description="Maximum number of nodes to keep"),
 ):
     """
-    Fetch ALL available pages of filtered profiles from the Skillab Tracker API using keywords
-    and an optional source filter. Results are cached locally in 'Completed_Analyses/'.
-    Builds a skill co-occurrence network (URI → label) with centrality metrics.
+    Fetch ALL available pages of filtered profiles. Cached in 'Completed_Analyses/'.
     """
-    API_URL = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-    USERNAME_ENV = os.getenv("TRACKER_USERNAME", "")
-    PASSWORD_ENV = os.getenv("TRACKER_PASSWORD", "")
-
-    # === 📁 Setup local cache folder ===
     folder = Path("Completed_Analyses")
-    if not folder.exists():
-        folder.mkdir(parents=True)
-        print(f"📁 Folder '{folder}' created.")
-    else:
-        print(f"📁 Folder '{folder}' already exists, moving on.")
+    folder.mkdir(parents=True, exist_ok=True)
 
-    # === 🏷️ Build deterministic cache filename ===
     keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
     filename = "completed_analysis_profiles_mapped"
     for kw in keywords_list:
@@ -1332,7 +949,6 @@ def profiles_mapped(
     file_path = folder / filename
     print(f"🗂️ Cache file path: {file_path}")
 
-    # === ✅ Return cached result if it already exists ===
     if file_path.exists():
         print(f"✅ Cache hit — loading results from '{file_path}' (skipping API call).")
         with open(file_path, "r", encoding="utf-8") as f:
@@ -1341,26 +957,20 @@ def profiles_mapped(
     print(f"🌐 No cache found — running full analysis from API...")
 
     try:
-        # === 1️⃣ Authenticate ===
         print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API_URL}/login", json={"username": USERNAME_ENV, "password": PASSWORD_ENV}, timeout=15)
+        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
         res.raise_for_status()
-        token = res.text.replace('"', "")
+        token   = res.text.replace('"', "")
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json"
         }
         print("✅ Authenticated successfully.")
-
-        # === 2️⃣ Log applied filters ===
         print(f"📡 Query — keywords: {keywords_list}")
         if source:
             print(f"🗂️ Source filter: {source}")
-        else:
-            print("🗂️ No source filter applied.")
 
-        # === 3️⃣ Helper: build form_data for each request ===
         def build_form_data():
             fd = [("keywords_logic", "or"), ("skill_ids_logic", "or")]
             for kw in keywords_list:
@@ -1369,17 +979,16 @@ def profiles_mapped(
                 fd.append(("sources", source))
             return fd
 
-        # === 4️⃣ Constants ===
-        page_size = 100
+        page_size       = 100
         REQUEST_TIMEOUT = 180
-        MAX_RETRIES = 3
-        RETRY_BACKOFF = 10
+        MAX_RETRIES     = 3
+        RETRY_BACKOFF   = 10
 
         def fetch_page_with_retry(page_num: int) -> dict:
-            url = f"{API_URL}/profiles?page={page_num}&page_size={page_size}"
+            url = f"{API}/profiles?page={page_num}&page_size={page_size}"
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    print(f"   ↪ Attempt {attempt}/{MAX_RETRIES} for page {page_num} (timeout={REQUEST_TIMEOUT}s)...")
+                    print(f"   ↪ Attempt {attempt}/{MAX_RETRIES} for page {page_num}...")
                     r = requests.post(url, headers=headers, data=build_form_data(), timeout=REQUEST_TIMEOUT)
                     if r.status_code != 200:
                         print(f"   ⚠️ HTTP {r.status_code} on page {page_num}: {r.text[:300]}")
@@ -1389,71 +998,55 @@ def profiles_mapped(
                     print(f"   ⏱️ ReadTimeout on page {page_num}, attempt {attempt}/{MAX_RETRIES}.")
                     if attempt < MAX_RETRIES:
                         print(f"   🔄 Retrying in {RETRY_BACKOFF}s...")
-                        import time; time.sleep(RETRY_BACKOFF)
+                        time.sleep(RETRY_BACKOFF)
                     else:
                         print(f"   ❌ All {MAX_RETRIES} attempts exhausted for page {page_num} — skipping.")
                         return {}
-                except requests.exceptions.ConnectionError as conn_err:
-                    print(f"   ❌ ConnectionError on page {page_num}: {conn_err}")
-                    return {}
                 except Exception as ex:
-                    print(f"   ❌ Unexpected error on page {page_num}: {type(ex).__name__}: {ex}")
+                    print(f"   ❌ {type(ex).__name__}: {ex}")
                     return {}
 
-        # === 5️⃣ Probe page 1 to determine total count & pages ===
         print("🔍 Probing API page 1 to determine total record count...")
         probe_data = fetch_page_with_retry(1)
-
         if not probe_data:
-            return {"error": "❌ Probe request (page 1) failed after all retries. Cannot determine total count."}
+            return {"error": "❌ Probe request (page 1) failed after all retries."}
 
         total_count = probe_data.get("count", 0)
         total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
-        print(f"📊 Total records available: {total_count} → {total_pages} page(s) to fetch (page_size={page_size})")
+        print(f"📊 Total records available: {total_count} → {total_pages} page(s)")
 
         if total_count == 0:
-            print("⚠️ No profiles found for the given filters.")
             return {"message": "No profiles found for the given filters."}
 
-        # === 6️⃣ Paginate through ALL available pages ===
         all_profiles = list(probe_data.get("items", []))
-        print(f"📦 Page 1/{total_pages}: {len(all_profiles)} profiles loaded from probe.")
+        print(f"📦 Page 1/{total_pages}: {len(all_profiles)} profiles loaded.")
 
         for page in range(2, total_pages + 1):
             print(f"📄 Fetching page {page}/{total_pages}...")
-            data = fetch_page_with_retry(page)
-
+            data  = fetch_page_with_retry(page)
             if not data:
-                print(f"⚠️ Page {page} returned no data after retries — stopping pagination early.")
+                print(f"⚠️ Page {page} returned no data — stopping.")
                 break
-
             items = data.get("items", [])
             print(f"📦 Page {page}/{total_pages}: {len(items)} profiles (running total: {len(all_profiles) + len(items)})")
-
             if not items:
-                print("✅ No more results — stopping early.")
                 break
-
             all_profiles.extend(items)
-
             if len(items) < page_size:
-                print("✅ Last page reached (fewer results than page_size).")
+                print("✅ Last page reached.")
                 break
 
-        print(f"🎯 Total profiles retrieved: {len(all_profiles)} / {total_count} available")
-
+        print(f"🎯 Total profiles retrieved: {len(all_profiles)} / {total_count}")
         if not all_profiles:
             return {"message": f"No profiles found for {keywords_list}."}
 
-        # === 7️⃣ Extract skills per profile ===
         skills_per_doc = [doc.get("skills", []) for doc in all_profiles if doc.get("skills")]
         print(f"📊 Profiles containing skills: {len(skills_per_doc)} / {len(all_profiles)}")
         if not skills_per_doc:
             return {"message": "⚠️ No skills found in the retrieved profiles."}
 
-        # === 8️⃣ Build co-occurrence matrix ===
         print("🕸️ Building skill co-occurrence matrix...")
-        co_counts = defaultdict(int)
+        co_counts    = defaultdict(int)
         skill_counts = defaultdict(int)
         for skills in skills_per_doc:
             unique_skills = set(skills)
@@ -1469,11 +1062,7 @@ def profiles_mapped(
             ci, cj = skill_counts[s1], skill_counts[s2]
             if ci and cj:
                 eij = (cij ** 2) / (ci * cj)
-                edges.append({
-                    "source": labelize(s1),
-                    "target": labelize(s2),
-                    "value": round(eij, 4)
-                })
+                edges.append({"source": labelize(s1), "target": labelize(s2), "value": round(eij, 4)})
 
         if not edges:
             return {"message": "⚠️ No co-occurrence relationships found."}
@@ -1481,7 +1070,6 @@ def profiles_mapped(
         print(f"✂️ Trimming to top {max_edges} edges (from {len(edges)} total)...")
         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
 
-        # === 9️⃣ Build graph and trim nodes ===
         G = nx.Graph()
         for e in edges:
             G.add_edge(e["source"], e["target"], value=e["value"])
@@ -1489,12 +1077,9 @@ def profiles_mapped(
         print(f"📈 Initial graph — Nodes: {len(G.nodes())}, Edges: {len(G.edges())}")
 
         if len(G.nodes()) > max_nodes:
-            node_strength = {
-                n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-                for n in G.nodes()
-            }
-            top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-            G = G.subgraph({n for n, _ in top_nodes}).copy()
+            node_strength = {n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True)) for n in G.nodes()}
+            top_nodes     = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+            G             = G.subgraph({n for n, _ in top_nodes}).copy()
             print(f"⚙️ Trimmed to top {len(G.nodes())} nodes by weighted degree")
 
         isolates = list(nx.isolates(G))
@@ -1505,14 +1090,13 @@ def profiles_mapped(
         if G.number_of_nodes() == 0:
             return {"message": "⚠️ No valid network could be built."}
 
-        # === 🔟 Compute centrality metrics ===
-        print("📈 Computing centrality metrics (degree, betweenness, closeness, clustering, eigenvector)...")
+        print("📈 Computing centrality metrics...")
         try:
-            degree_dict = dict(G.degree())
+            degree_dict     = dict(G.degree())
             weighted_degree = dict(G.degree(weight="value"))
-            betweenness = nx.betweenness_centrality(G, weight="value", normalized=True)
-            closeness = nx.closeness_centrality(G)
-            clustering = nx.clustering(G, weight="value")
+            betweenness     = nx.betweenness_centrality(G, weight="value", normalized=True)
+            closeness       = nx.closeness_centrality(G)
+            clustering      = nx.clustering(G, weight="value")
             try:
                 eigenvector = nx.eigenvector_centrality(G, weight="value", max_iter=500)
                 print("✅ Eigenvector centrality converged.")
@@ -1521,12 +1105,11 @@ def profiles_mapped(
                 print("⚠️ Eigenvector centrality did not converge — defaulting to 0.")
         except Exception as e:
             print(f"⚠️ Metric computation error: {e} — falling back to zeros.")
-            degree_dict = dict(G.degree())
+            degree_dict     = dict(G.degree())
             weighted_degree = dict(G.degree(weight="value"))
             betweenness = closeness = clustering = eigenvector = {n: 0 for n in G.nodes()}
 
-        # === 1️⃣1️⃣ Prepare labeled network output ===
-        nodes = [
+        nodes_out = [
             {
                 "id": n,
                 "degree": degree_dict.get(n, 0),
@@ -1538,377 +1121,54 @@ def profiles_mapped(
             }
             for n in G.nodes()
         ]
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in G.edges(data=True)
-        ]
+        edges_gc = [{"source": u, "target": v, "value": round(d["value"], 4)} for u, v, d in G.edges(data=True)]
 
-        print(f"🌐 Final profile network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
+        print(f"🌐 Final profile network — Nodes: {len(nodes_out)}, Edges: {len(edges_gc)}")
 
         result = {
             "message": f"✅ Skill co-occurrence network built for {len(all_profiles)} profiles ({total_pages} pages, {total_count} total available).",
-            "filters_used": {
-                "keywords": keywords_list,
-                "source": source,
-            },
+            "filters_used": {"keywords": keywords_list, "source": source},
             "summary": {
                 "Profiles Retrieved": len(all_profiles),
                 "Total Profiles Available": total_count,
                 "Pages Fetched": total_pages,
                 "Profiles with Skills": len(skills_per_doc),
-                "Nodes": len(nodes),
+                "Nodes": len(nodes_out),
                 "Edges": len(edges_gc)
             },
-            "giant_component": {"nodes": nodes, "edges": edges_gc}
+            "giant_component": {"nodes": nodes_out, "edges": edges_gc}
         }
 
-        # === 💾 Save result to local cache ===
         print(f"💾 Saving results to cache: '{file_path}'...")
         with open(file_path, "w", encoding="utf-8") as json_file:
             json.dump(result, json_file, indent=4, ensure_ascii=False)
         print(f"✅ Results cached successfully to '{file_path}'.")
-
         return result
 
     except Exception as e:
         print(f"❌ ERROR in profiles_mapped: {e}")
         return {"error": str(e)}
-# ============================================================
-#  ✅ MODIFIED ENDPOINT: /api/jobs_mapped_ultra
-#  Changes:
-#    1. Added `occupation_ids` (Optional[str]) parameter
-#    2. Removed user-controlled `max_pages` — auto-fetches ALL pages
-#    3. Results cached to Completed_Analyses/<filename>.json
-#    4. Detailed print monitoring throughout
-# ============================================================
 
-# @app.get("/api/jobs_mapped_ultra")
-# def jobs_mapped(
-#     keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, software)"),
-#     source: str = Query(None, description="Optional source filter for jobs (e.g. linkedin, indeed)"),
-#     occupation_ids: Optional[str] = Query(
-#         None, description="Comma-separated occupation IDs (e.g. http://data.europa.eu/esco/occupation/...)"
-#     ),
-#     min_upload_date: str = Query(None, description="Minimum upload date (YYYY-MM-DD)"),
-#     max_upload_date: str = Query(None, description="Maximum upload date (YYYY-MM-DD)"),
-#     max_edges: int = Query(200, description="Maximum number of edges to keep"),
-#     max_nodes: int = Query(200, description="Maximum number of nodes to keep"),
-# ):
-#     """
-#     Fetch ALL available pages of filtered jobs from the Skillab Tracker API using keywords,
-#     optional occupation IDs, and optional date/source filters.
-#     Results are cached locally in the 'Completed_Analyses' folder to avoid redundant API calls.
-#     Builds a skill co-occurrence network (URI → label) with centrality metrics.
-#     """
-#     API_URL = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-#     USERNAME_ENV = os.getenv("TRACKER_USERNAME", "")
-#     PASSWORD_ENV = os.getenv("TRACKER_PASSWORD", "")
-#
-#     # === 📁 Setup local cache folder ===
-#     folder = Path("Completed_Analyses")
-#     if not folder.exists():
-#         folder.mkdir(parents=True)
-#         print(f"📁 Folder '{folder}' created.")
-#     else:
-#         print(f"📁 Folder '{folder}' already exists, moving on.")
-#
-#     # === 🏷️ Build deterministic cache filename from query parameters ===
-#     keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-#     occ_ids_list = [o.strip() for o in occupation_ids.split(",") if o.strip()] if occupation_ids else []
-#
-#     filename = "completed_analysis_jobs_mapped_ultra"
-#     for kw in keywords_list:
-#         filename += f"_{kw}"
-#     for occ in occ_ids_list:
-#         match = re.search(r'C\d+$', occ)
-#         filename += f"_{match.group(0)}" if match else f"_{occ.replace('/', '_').replace(':', '').replace('.', '')}"
-#     if source:
-#         filename += f"_{source}"
-#     if min_upload_date:
-#         filename += f"_from{min_upload_date}"
-#     if max_upload_date:
-#         filename += f"_to{max_upload_date}"
-#     filename += ".json"
-#
-#     file_path = folder / filename
-#     print(f"🗂️ Cache file path: {file_path}")
-#
-#     # === ✅ Return cached result if it already exists ===
-#     if file_path.exists():
-#         print(f"✅ Cache hit — loading results from '{file_path}' (skipping API call).")
-#         with open(file_path, "r", encoding="utf-8") as f:
-#             return json.loads(f.read())
-#
-#     print(f"🌐 No cache found — running full analysis from API...")
-#
-#     try:
-#         # === 1️⃣ Authenticate ===
-#         print("🔐 Authenticating with Tracker...")
-#         res = requests.post(f"{API_URL}/login", json={"username": USERNAME_ENV, "password": PASSWORD_ENV}, timeout=15)
-#         res.raise_for_status()
-#         token = res.text.replace('"', "")
-#         headers = {
-#             "Authorization": f"Bearer {token}",
-#             "Content-Type": "application/x-www-form-urlencoded",
-#             "Accept": "application/json"
-#         }
-#         print("✅ Authenticated successfully.")
-#
-#         # === 2️⃣ Log applied filters ===
-#         print(f"📡 Query — keywords: {keywords_list}")
-#         if occ_ids_list:
-#             print(f"🏢 Occupation IDs filter: {occ_ids_list}")
-#         else:
-#             print("🏢 No occupation_ids filter applied.")
-#         if source:
-#             print(f"🗂️ Source filter: {source}")
-#         if min_upload_date or max_upload_date:
-#             print(f"📅 Date range: {min_upload_date or 'any'} → {max_upload_date or 'any'}")
-#
-#         # === 3️⃣ Helper: build form_data for each request ===
-#         def build_form_data():
-#             fd = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("occupation_ids_logic", "or")]
-#             for kw in keywords_list:
-#                 fd.append(("keywords", kw))
-#             for occ in occ_ids_list:
-#                 fd.append(("occupation_ids", occ))
-#             if source:
-#                 fd.append(("sources", source))
-#             if min_upload_date:
-#                 fd.append(("min_upload_date", min_upload_date))
-#             if max_upload_date:
-#                 fd.append(("max_upload_date", max_upload_date))
-#             return fd
-#
-#         # === 4️⃣ Probe page 1 to determine total count & pages ===
-#         page_size = 100
-#         print("🔍 Probing API page 1 to determine total record count...")
-#         probe_res = requests.post(
-#             f"{API_URL}/jobs?page=1&page_size={page_size}",
-#             headers=headers,
-#             data=build_form_data(),
-#             timeout=90
-#         )
-#         probe_res.raise_for_status()
-#         probe_data = probe_res.json()
-#
-#         total_count = probe_data.get("count", 0)
-#         total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
-#         print(f"📊 Total records available: {total_count} → {total_pages} page(s) to fetch (page_size={page_size})")
-#
-#         if total_count == 0:
-#             print("⚠️ No job postings found for the given filters.")
-#             return {"message": "No job postings found for the given filters."}
-#
-#         # === 5️⃣ Paginate through ALL available pages ===
-#         all_jobs = list(probe_data.get("items", []))  # reuse probe results for page 1
-#         print(f"📦 Page 1/{total_pages}: {len(all_jobs)} job postings loaded from probe.")
-#
-#         for page in range(2, total_pages + 1):
-#             print(f"📄 Fetching page {page}/{total_pages}...")
-#             res = requests.post(
-#                 f"{API_URL}/jobs?page={page}&page_size={page_size}",
-#                 headers=headers,
-#                 data=build_form_data(),
-#                 timeout=90
-#             )
-#             if res.status_code != 200:
-#                 print(f"⚠️ Page {page}: HTTP {res.status_code} → {res.text[:200]}")
-#                 break
-#
-#             data = res.json()
-#             items = data.get("items", [])
-#             print(f"📦 Page {page}/{total_pages}: {len(items)} job postings (running total: {len(all_jobs) + len(items)})")
-#
-#             if not items:
-#                 print("✅ No more results — stopping early.")
-#                 break
-#
-#             all_jobs.extend(items)
-#
-#             if len(items) < page_size:
-#                 print("✅ Last page reached (fewer results than page_size).")
-#                 break
-#
-#         print(f"🎯 Total jobs retrieved: {len(all_jobs)} / {total_count} available")
-#
-#         if not all_jobs:
-#             return {"message": f"No job postings found for {keywords_list}."}
-#
-#         # === 6️⃣ Extract skills per job ===
-#         skills_per_doc = [doc.get("skills", []) for doc in all_jobs if doc.get("skills")]
-#         print(f"📊 Job postings containing skills: {len(skills_per_doc)} / {len(all_jobs)}")
-#         if not skills_per_doc:
-#             return {"message": "⚠️ No skills found in the retrieved job postings."}
-#
-#         # === 7️⃣ Build co-occurrence matrix ===
-#         print("🕸️ Building skill co-occurrence matrix...")
-#         co_counts = defaultdict(int)
-#         skill_counts = defaultdict(int)
-#         for skills in skills_per_doc:
-#             unique_skills = set(skills)
-#             for s in unique_skills:
-#                 skill_counts[s] += 1
-#             for s1, s2 in combinations(sorted(unique_skills), 2):
-#                 co_counts[(s1, s2)] += 1
-#
-#         print(f"🔗 Raw co-occurrence pairs: {len(co_counts)} | Unique skills seen: {len(skill_counts)}")
-#
-#         edges = []
-#         for (s1, s2), cij in co_counts.items():
-#             ci, cj = skill_counts[s1], skill_counts[s2]
-#             if ci and cj:
-#                 eij = (cij ** 2) / (ci * cj)
-#                 edges.append({
-#                     "source": labelize(s1),
-#                     "target": labelize(s2),
-#                     "value": round(eij, 4)
-#                 })
-#
-#         if not edges:
-#             return {"message": "⚠️ No co-occurrence relationships found."}
-#
-#         print(f"✂️ Trimming to top {max_edges} edges (from {len(edges)} total)...")
-#         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-#
-#         # === 8️⃣ Build graph and trim nodes ===
-#         G = nx.Graph()
-#         for e in edges:
-#             G.add_edge(e["source"], e["target"], value=e["value"])
-#
-#         print(f"📈 Initial graph — Nodes: {len(G.nodes())}, Edges: {len(G.edges())}")
-#
-#         if len(G.nodes()) > max_nodes:
-#             node_strength = {
-#                 n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-#                 for n in G.nodes()
-#             }
-#             top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-#             G = G.subgraph({n for n, _ in top_nodes}).copy()
-#             print(f"⚙️ Trimmed to top {len(G.nodes())} nodes by weighted degree")
-#
-#         isolates = list(nx.isolates(G))
-#         if isolates:
-#             G.remove_nodes_from(isolates)
-#             print(f"🧹 Removed {len(isolates)} isolated nodes")
-#
-#         if G.number_of_nodes() == 0:
-#             return {"message": "⚠️ No valid network could be built."}
-#
-#         # === 9️⃣ Compute centrality metrics ===
-#         print("📈 Computing centrality metrics (degree, betweenness, closeness, clustering, eigenvector)...")
-#         try:
-#             degree_dict = dict(G.degree())
-#             weighted_degree = dict(G.degree(weight="value"))
-#             betweenness = nx.betweenness_centrality(G, weight="value", normalized=True)
-#             closeness = nx.closeness_centrality(G)
-#             clustering = nx.clustering(G, weight="value")
-#             try:
-#                 eigenvector = nx.eigenvector_centrality(G, weight="value", max_iter=500)
-#                 print("✅ Eigenvector centrality converged.")
-#             except nx.PowerIterationFailedConvergence:
-#                 eigenvector = {n: 0 for n in G.nodes()}
-#                 print("⚠️ Eigenvector centrality did not converge — defaulting to 0.")
-#         except Exception as e:
-#             print(f"⚠️ Metric computation error: {e} — falling back to zeros.")
-#             degree_dict = dict(G.degree())
-#             weighted_degree = dict(G.degree(weight="value"))
-#             betweenness = closeness = clustering = eigenvector = {n: 0 for n in G.nodes()}
-#
-#         # === 🔟 Prepare labeled network output ===
-#         nodes = [
-#             {
-#                 "id": n,
-#                 "degree": degree_dict.get(n, 0),
-#                 "weighted_degree": round(weighted_degree.get(n, 0), 4),
-#                 "betweenness": round(betweenness.get(n, 0), 5),
-#                 "closeness": round(closeness.get(n, 0), 5),
-#                 "clustering": round(clustering.get(n, 0), 5),
-#                 "eigenvector": round(eigenvector.get(n, 0), 5)
-#             }
-#             for n in G.nodes()
-#         ]
-#         edges_gc = [
-#             {"source": u, "target": v, "value": round(d["value"], 4)}
-#             for u, v, d in G.edges(data=True)
-#         ]
-#
-#         print(f"🌐 Final job network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
-#
-#         result = {
-#             "message": f"✅ Skill co-occurrence network built for {len(all_jobs)} job postings ({total_pages} pages, {total_count} total available).",
-#             "filters_used": {
-#                 "keywords": keywords_list,
-#                 "occupation_ids": occ_ids_list if occ_ids_list else None,
-#                 "source": source,
-#                 "min_upload_date": min_upload_date,
-#                 "max_upload_date": max_upload_date,
-#             },
-#             "summary": {
-#                 "Jobs Retrieved": len(all_jobs),
-#                 "Total Jobs Available": total_count,
-#                 "Pages Fetched": total_pages,
-#                 "Jobs with Skills": len(skills_per_doc),
-#                 "Nodes": len(nodes),
-#                 "Edges": len(edges_gc)
-#             },
-#             "giant_component": {"nodes": nodes, "edges": edges_gc}
-#         }
-#
-#         # === 💾 Save result to local cache ===
-#         print(f"💾 Saving results to cache: '{file_path}'...")
-#         with open(file_path, "w", encoding="utf-8") as json_file:
-#             json.dump(result, json_file, indent=4, ensure_ascii=False)
-#         print(f"✅ Results cached successfully to '{file_path}'.")
-#
-#         return result
-#
-#     except Exception as e:
-#         print(f"❌ ERROR in jobs_mapped_ultra: {e}")
-#         return {"error": str(e)}
-
-# ============================================================
-#  ✅ MODIFIED ENDPOINT: /api/jobs_mapped_ultra
-#  Changes:
-#    1. Added `occupation_ids` (Optional[str]) parameter
-#    2. Removed user-controlled `max_pages` — auto-fetches ALL pages
-#    3. Results cached to Completed_Analyses/<filename>.json
-#    4. Detailed print monitoring throughout
-# ============================================================
 
 @app.get("/api/jobs_mapped_ultra")
 def jobs_mapped(
-    keywords: Optional[str] = Query(None, description="Comma-separated keywords (e.g. AI, data, software)"),
-    source: str = Query(None, description="Optional source filter for jobs (e.g. linkedin, indeed)"),
-    occupation_ids: Optional[str] = Query(
-        None, description="Comma-separated occupation IDs (e.g. http://data.europa.eu/esco/occupation/...)"
-    ),
-    min_upload_date: str = Query(None, description="Minimum upload date (YYYY-MM-DD)"),
-    max_upload_date: str = Query(None, description="Maximum upload date (YYYY-MM-DD)"),
-    max_edges: int = Query(200, description="Maximum number of edges to keep"),
-    max_nodes: int = Query(200, description="Maximum number of nodes to keep"),
+    keywords:        Optional[str] = Query(None, description="Comma-separated keywords (e.g. AI, data, software)"),
+    source:          str           = Query(None, description="Optional source filter for jobs (e.g. linkedin, indeed)"),
+    occupation_ids:  Optional[str] = Query(None, description="Comma-separated occupation IDs (e.g. http://data.europa.eu/esco/occupation/...)"),
+    min_upload_date: str           = Query(None, description="Minimum upload date (YYYY-MM-DD)"),
+    max_upload_date: str           = Query(None, description="Maximum upload date (YYYY-MM-DD)"),
+    max_edges:       int           = Query(200,  description="Maximum number of edges to keep"),
+    max_nodes:       int           = Query(200,  description="Maximum number of nodes to keep"),
 ):
     """
-    Fetch ALL available pages of filtered jobs from the Skillab Tracker API using keywords,
-    optional occupation IDs, and optional date/source filters.
-    Results are cached locally in the 'Completed_Analyses' folder to avoid redundant API calls.
+    Fetch ALL available pages of filtered jobs. Cached in 'Completed_Analyses/'.
     Builds a skill co-occurrence network (URI → label) with centrality metrics.
     """
-    API_URL = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-    USERNAME_ENV = os.getenv("TRACKER_USERNAME", "")
-    PASSWORD_ENV = os.getenv("TRACKER_PASSWORD", "")
-
-    # === 📁 Setup local cache folder ===
     folder = Path("Completed_Analyses")
-    if not folder.exists():
-        folder.mkdir(parents=True)
-        print(f"📁 Folder '{folder}' created.")
-    else:
-        print(f"📁 Folder '{folder}' already exists, moving on.")
+    folder.mkdir(parents=True, exist_ok=True)
 
-    # === 🏷️ Build deterministic cache filename from query parameters ===
     keywords_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else []
-    occ_ids_list = [o.strip() for o in occupation_ids.split(",") if o.strip()] if occupation_ids else []
+    occ_ids_list  = [o.strip() for o in occupation_ids.split(",") if o.strip()] if occupation_ids else []
 
     filename = "completed_analysis_jobs_mapped_ultra"
     for kw in keywords_list:
@@ -1927,7 +1187,6 @@ def jobs_mapped(
     file_path = folder / filename
     print(f"🗂️ Cache file path: {file_path}")
 
-    # === ✅ Return cached result if it already exists ===
     if file_path.exists():
         print(f"✅ Cache hit — loading results from '{file_path}' (skipping API call).")
         with open(file_path, "r", encoding="utf-8") as f:
@@ -1936,30 +1195,24 @@ def jobs_mapped(
     print(f"🌐 No cache found — running full analysis from API...")
 
     try:
-        # === 1️⃣ Authenticate ===
         print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API_URL}/login", json={"username": USERNAME_ENV, "password": PASSWORD_ENV}, timeout=15)
+        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
         res.raise_for_status()
-        token = res.text.replace('"', "")
+        token   = res.text.replace('"', "")
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json"
         }
         print("✅ Authenticated successfully.")
-
-        # === 2️⃣ Log applied filters ===
         print(f"📡 Query — keywords: {keywords_list if keywords_list else '(none)'}")
         if occ_ids_list:
             print(f"🏢 Occupation IDs filter: {occ_ids_list}")
-        else:
-            print("🏢 No occupation_ids filter applied.")
         if source:
             print(f"🗂️ Source filter: {source}")
         if min_upload_date or max_upload_date:
             print(f"📅 Date range: {min_upload_date or 'any'} → {max_upload_date or 'any'}")
 
-        # === 3️⃣ Helper: build form_data for each request ===
         def build_form_data():
             fd = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("occupation_ids_logic", "or")]
             for kw in keywords_list:
@@ -1974,15 +1227,13 @@ def jobs_mapped(
                 fd.append(("max_upload_date", max_upload_date))
             return fd
 
-        # === 4️⃣ Probe page 1 to determine total count & pages ===
-        page_size = 100
-        REQUEST_TIMEOUT = 180   # seconds per request — increased from 90
-        MAX_RETRIES = 3         # retry each page this many times on timeout
-        RETRY_BACKOFF = 10      # seconds to wait between retries
+        page_size       = 100
+        REQUEST_TIMEOUT = 180
+        MAX_RETRIES     = 3
+        RETRY_BACKOFF   = 10
 
         def fetch_page_with_retry(page_num: int) -> dict:
-            """POST to /jobs for a specific page, retrying up to MAX_RETRIES times on timeout."""
-            url = f"{API_URL}/jobs?page={page_num}&page_size={page_size}"
+            url = f"{API}/jobs?page={page_num}&page_size={page_size}"
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     print(f"   ↪ Attempt {attempt}/{MAX_RETRIES} for page {page_num} (timeout={REQUEST_TIMEOUT}s)...")
@@ -1995,70 +1246,56 @@ def jobs_mapped(
                     print(f"   ⏱️ ReadTimeout on page {page_num}, attempt {attempt}/{MAX_RETRIES}.")
                     if attempt < MAX_RETRIES:
                         print(f"   🔄 Retrying in {RETRY_BACKOFF}s...")
-                        import time; time.sleep(RETRY_BACKOFF)
+                        time.sleep(RETRY_BACKOFF)
                     else:
                         print(f"   ❌ All {MAX_RETRIES} attempts exhausted for page {page_num} — skipping.")
                         return {}
-                except requests.exceptions.ConnectionError as conn_err:
-                    print(f"   ❌ ConnectionError on page {page_num}: {conn_err}")
-                    return {}
                 except Exception as ex:
-                    print(f"   ❌ Unexpected error on page {page_num}: {type(ex).__name__}: {ex}")
+                    print(f"   ❌ {type(ex).__name__}: {ex}")
                     return {}
 
         print("🔍 Probing API page 1 to determine total record count...")
         probe_data = fetch_page_with_retry(1)
-
         if not probe_data:
-            return {"error": "❌ Probe request (page 1) failed after all retries. Cannot determine total count."}
+            return {"error": "❌ Probe request (page 1) failed after all retries."}
 
         total_count = probe_data.get("count", 0)
         total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
-        print(f"📊 Total records available: {total_count} → {total_pages} page(s) to fetch (page_size={page_size})")
+        print(f"📊 Total records available: {total_count} → {total_pages} page(s)")
 
         if total_count == 0:
-            print("⚠️ No job postings found for the given filters.")
             return {"message": "No job postings found for the given filters."}
 
-        # === 5️⃣ Paginate through ALL available pages ===
-        all_jobs = list(probe_data.get("items", []))  # reuse probe results for page 1
+        all_jobs = list(probe_data.get("items", []))
         print(f"📦 Page 1/{total_pages}: {len(all_jobs)} job postings loaded from probe.")
 
         for page in range(2, total_pages + 1):
             print(f"📄 Fetching page {page}/{total_pages}...")
             data = fetch_page_with_retry(page)
-
             if not data:
-                print(f"⚠️ Page {page} returned no data after retries — stopping pagination early.")
+                print(f"⚠️ Page {page} returned no data — stopping.")
                 break
-
             items = data.get("items", [])
             print(f"📦 Page {page}/{total_pages}: {len(items)} job postings (running total: {len(all_jobs) + len(items)})")
-
             if not items:
                 print("✅ No more results — stopping early.")
                 break
-
             all_jobs.extend(items)
-
             if len(items) < page_size:
-                print("✅ Last page reached (fewer results than page_size).")
+                print("✅ Last page reached.")
                 break
 
         print(f"🎯 Total jobs retrieved: {len(all_jobs)} / {total_count} available")
-
         if not all_jobs:
             return {"message": f"No job postings found for {keywords_list}."}
 
-        # === 6️⃣ Extract skills per job ===
         skills_per_doc = [doc.get("skills", []) for doc in all_jobs if doc.get("skills")]
         print(f"📊 Job postings containing skills: {len(skills_per_doc)} / {len(all_jobs)}")
         if not skills_per_doc:
             return {"message": "⚠️ No skills found in the retrieved job postings."}
 
-        # === 7️⃣ Build co-occurrence matrix ===
         print("🕸️ Building skill co-occurrence matrix...")
-        co_counts = defaultdict(int)
+        co_counts    = defaultdict(int)
         skill_counts = defaultdict(int)
         for skills in skills_per_doc:
             unique_skills = set(skills)
@@ -2074,11 +1311,7 @@ def jobs_mapped(
             ci, cj = skill_counts[s1], skill_counts[s2]
             if ci and cj:
                 eij = (cij ** 2) / (ci * cj)
-                edges.append({
-                    "source": labelize(s1),
-                    "target": labelize(s2),
-                    "value": round(eij, 4)
-                })
+                edges.append({"source": labelize(s1), "target": labelize(s2), "value": round(eij, 4)})
 
         if not edges:
             return {"message": "⚠️ No co-occurrence relationships found."}
@@ -2086,7 +1319,6 @@ def jobs_mapped(
         print(f"✂️ Trimming to top {max_edges} edges (from {len(edges)} total)...")
         edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
 
-        # === 8️⃣ Build graph and trim nodes ===
         G = nx.Graph()
         for e in edges:
             G.add_edge(e["source"], e["target"], value=e["value"])
@@ -2094,12 +1326,9 @@ def jobs_mapped(
         print(f"📈 Initial graph — Nodes: {len(G.nodes())}, Edges: {len(G.edges())}")
 
         if len(G.nodes()) > max_nodes:
-            node_strength = {
-                n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True))
-                for n in G.nodes()
-            }
-            top_nodes = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-            G = G.subgraph({n for n, _ in top_nodes}).copy()
+            node_strength = {n: sum(d.get("value", 1) for _, _, d in G.edges(n, data=True)) for n in G.nodes()}
+            top_nodes     = sorted(node_strength.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+            G             = G.subgraph({n for n, _ in top_nodes}).copy()
             print(f"⚙️ Trimmed to top {len(G.nodes())} nodes by weighted degree")
 
         isolates = list(nx.isolates(G))
@@ -2110,14 +1339,13 @@ def jobs_mapped(
         if G.number_of_nodes() == 0:
             return {"message": "⚠️ No valid network could be built."}
 
-        # === 9️⃣ Compute centrality metrics ===
-        print("📈 Computing centrality metrics (degree, betweenness, closeness, clustering, eigenvector)...")
+        print("📈 Computing centrality metrics...")
         try:
-            degree_dict = dict(G.degree())
+            degree_dict     = dict(G.degree())
             weighted_degree = dict(G.degree(weight="value"))
-            betweenness = nx.betweenness_centrality(G, weight="value", normalized=True)
-            closeness = nx.closeness_centrality(G)
-            clustering = nx.clustering(G, weight="value")
+            betweenness     = nx.betweenness_centrality(G, weight="value", normalized=True)
+            closeness       = nx.closeness_centrality(G)
+            clustering      = nx.clustering(G, weight="value")
             try:
                 eigenvector = nx.eigenvector_centrality(G, weight="value", max_iter=500)
                 print("✅ Eigenvector centrality converged.")
@@ -2126,12 +1354,11 @@ def jobs_mapped(
                 print("⚠️ Eigenvector centrality did not converge — defaulting to 0.")
         except Exception as e:
             print(f"⚠️ Metric computation error: {e} — falling back to zeros.")
-            degree_dict = dict(G.degree())
+            degree_dict     = dict(G.degree())
             weighted_degree = dict(G.degree(weight="value"))
             betweenness = closeness = clustering = eigenvector = {n: 0 for n in G.nodes()}
 
-        # === 🔟 Prepare labeled network output ===
-        nodes = [
+        nodes_out = [
             {
                 "id": n,
                 "degree": degree_dict.get(n, 0),
@@ -2143,12 +1370,9 @@ def jobs_mapped(
             }
             for n in G.nodes()
         ]
-        edges_gc = [
-            {"source": u, "target": v, "value": round(d["value"], 4)}
-            for u, v, d in G.edges(data=True)
-        ]
+        edges_gc = [{"source": u, "target": v, "value": round(d["value"], 4)} for u, v, d in G.edges(data=True)]
 
-        print(f"🌐 Final job network — Nodes: {len(nodes)}, Edges: {len(edges_gc)}")
+        print(f"🌐 Final job network — Nodes: {len(nodes_out)}, Edges: {len(edges_gc)}")
 
         result = {
             "message": f"✅ Skill co-occurrence network built for {len(all_jobs)} job postings ({total_pages} pages, {total_count} total available).",
@@ -2164,28 +1388,18 @@ def jobs_mapped(
                 "Total Jobs Available": total_count,
                 "Pages Fetched": total_pages,
                 "Jobs with Skills": len(skills_per_doc),
-                "Nodes": len(nodes),
+                "Nodes": len(nodes_out),
                 "Edges": len(edges_gc)
             },
-            "giant_component": {"nodes": nodes, "edges": edges_gc}
+            "giant_component": {"nodes": nodes_out, "edges": edges_gc}
         }
 
-        # === 💾 Save result to local cache ===
         print(f"💾 Saving results to cache: '{file_path}'...")
         with open(file_path, "w", encoding="utf-8") as json_file:
             json.dump(result, json_file, indent=4, ensure_ascii=False)
         print(f"✅ Results cached successfully to '{file_path}'.")
-
         return result
 
     except Exception as e:
         print(f"❌ ERROR in jobs_mapped_ultra: {e}")
         return {"error": str(e)}
-
-
-
-
-
-
-
-
