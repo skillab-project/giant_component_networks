@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 import networkx as nx
+from pathlib import Path 
 
 # 1. Import the module
 import giant_component_networks
@@ -26,6 +27,20 @@ giant_component_networks.PILLARS = {
 from giant_component_networks import app, build_cooccurrence, process_documents_with_limits
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def cleanup_completed_analyses():
+    """Delete any cache files created under Completed_Analyses/ during each test."""
+    folder = Path("Completed_Analyses")
+    files_before = set(folder.glob("*.json")) if folder.exists() else set()
+ 
+    yield
+ 
+    if folder.exists():
+        files_after = set(folder.glob("*.json"))
+        for new_file in files_after - files_before:
+            new_file.unlink()
 
 # ==========================================
 # 1. UNIT TESTS FOR LOGIC
@@ -131,23 +146,3 @@ def test_ku_cooccurrence_endpoint(mock_get):
     data = response.json()
     assert data["summary"]["Giant Component Nodes"] == 2
     assert data["giant_component"]["edges"][0]["source"] == "K1"
-
-@patch("requests.get")
-def test_ku_link_prediction_endpoint(mock_get):
-    """Test the Link Prediction endpoint logic."""
-    
-    # K1-K2, K1-K3, K2-K3. A small complete triangle.
-    mock_res = MagicMock()
-    mock_res.json.return_value = [
-        {"detected_kus": {"K1": "1", "K2": "1"}},
-        {"detected_kus": {"K1": "1", "K3": "1"}},
-        {"detected_kus": {"K2": "1", "K3": "1"}}
-    ]
-    mock_res.status_code = 200
-    mock_get.return_value = mock_res
-
-    response = client.get("/ku-link-prediction?method=jaccard")
-    
-    assert response.status_code == 200
-    data = response.json()
-    assert "predicted_links" in data

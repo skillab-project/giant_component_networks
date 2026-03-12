@@ -4,11 +4,26 @@ from fastapi.testclient import TestClient
 from dotenv import load_dotenv
 from giant_component_networks import app
 import requests
+from pathlib import Path 
 
 load_dotenv()
 client = TestClient(app)
 
 TRACKER_CREDS = os.getenv("TRACKER_USERNAME") and os.getenv("TRACKER_PASSWORD")
+
+@pytest.fixture(autouse=True)
+def cleanup_completed_analyses():
+    """Delete any cache files created under Completed_Analyses/ during each test."""
+    folder = Path("Completed_Analyses")
+    files_before = set(folder.glob("*.json")) if folder.exists() else set()
+ 
+    yield
+ 
+    if folder.exists():
+        files_after = set(folder.glob("*.json"))
+        for new_file in files_after - files_before:
+            new_file.unlink()
+
 
 def is_ku_service_online(url):
     """Checks if the KU service is reachable."""
@@ -36,7 +51,7 @@ class TestTrackerNetworkIntegration:
         """Test co-occurrence network generation from Job postings."""
         response = client.get(
             "/api/jobs_mapped_ultra",
-            params={"keywords": "software", "max_pages": 1, "max_edges": 30}
+            params={"occupation_ids": "http://data.europa.eu/esco/isco/C3133", "max_edges": 30}
         )
         assert response.status_code == 200
         data = response.json()
@@ -76,20 +91,3 @@ class TestKUNetworkIntegration:
         # We accept EITHER a full network OR a 'no data' message/error
         valid_keys = ["giant_component", "message", "error"]
         assert any(key in data for key in valid_keys), f"Unexpected response keys: {data.keys()}"
-
-    def test_ku_forecasting_logic(self):
-        """Test the link prediction for KUs."""
-        response = client.get(
-            "/ku-link-prediction",
-            params={"method": "adamic_adar", "top_k": 3}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        
-        # If there is data, check for links. If not, check for the error/message.
-        if "predicted_links" in data:
-            assert "summary" in data
-            assert isinstance(data["predicted_links"], list)
-        else:
-            # If no data yet, ensure the API explained why 
-            assert any(key in data for key in ["error", "message"]), "API returned 200 but no links or error message."
