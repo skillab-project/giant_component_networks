@@ -12,6 +12,7 @@ import requests
 import os
 import time
 from dotenv import load_dotenv
+import datetime
 
 # === Load environment variables ===
 load_dotenv()
@@ -38,6 +39,48 @@ def get_token():
     except Exception as e:
         print(f"❌ Login failed: {e}")
         raise
+
+
+def check_analysis_status(file_path: Path):
+    """
+    Checks if an analysis is already running or completed.
+    Returns: (bool_should_start, return_message_or_data)
+    """
+    if file_path.exists():
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                cached_data = json.loads(f.read())
+            
+            # Case 1: Analysis is already completed
+            if cached_data.get("status") == "completed":
+                print(f"✅ Cache hit — returning completed results.")
+                return False, cached_data.get("result")
+
+            # Case 2: Analysis is in progress
+            if cached_data.get("status") == "in_progress":
+                started_at = datetime.datetime.fromisoformat(cached_data.get("started_at"))
+                elapsed = (datetime.datetime.now() - started_at).total_seconds()
+                
+                # If it's been running for more than 15 minutes, assume it crashed and restart
+                if elapsed < 900: 
+                    print(f"⏳ Analysis already in progress (started {int(elapsed)}s ago).")
+                    return False, {"message": "This analysis is currently being processed by another request. Please try again in a few minutes."}
+                else:
+                    print(f"⚠️ Found stale lock file (>15 mins old). Restarting analysis...")
+                    return True, None
+        except Exception as e:
+            print(f"⚠️ Error reading status file: {e}. Restarting...")
+            return True, None
+
+    return True, None
+
+def mark_analysis_in_progress(file_path: Path):
+    """Creates the lock file."""
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "status": "in_progress",
+            "started_at": datetime.datetime.now().isoformat()
+        }, f)
 
 
 # === 2️⃣ Fetch ALL ESCO Skills from Tracker (all sources, auto-paginated) ===
@@ -952,10 +995,13 @@ def profiles_mapped(
     file_path = folder / filename
     print(f"🗂️ Cache file path: {file_path}")
 
-    if file_path.exists():
-        print(f"✅ Cache hit — loading results from '{file_path}' (skipping API call).")
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.loads(f.read())
+    # --- 1. Check Status ---
+    should_start, response_data = check_analysis_status(file_path)
+    if not should_start:
+        return response_data
+
+    # --- 2. Lock the analysis ---
+    mark_analysis_in_progress(file_path)
 
     print(f"🌐 No cache found — running full analysis from API...")
 
@@ -1150,6 +1196,8 @@ def profiles_mapped(
 
     except Exception as e:
         print(f"❌ ERROR in profiles_mapped: {e}")
+        if file_path.exists():
+            file_path.unlink()
         return {"error": str(e)}
 
 
@@ -1190,10 +1238,13 @@ def jobs_mapped(
     file_path = folder / filename
     print(f"🗂️ Cache file path: {file_path}")
 
-    if file_path.exists():
-        print(f"✅ Cache hit — loading results from '{file_path}' (skipping API call).")
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.loads(f.read())
+    # --- 1. Check Status ---
+    should_start, response_data = check_analysis_status(file_path)
+    if not should_start:
+        return response_data
+
+    # --- 2. Lock the analysis ---
+    mark_analysis_in_progress(file_path)
 
     print(f"🌐 No cache found — running full analysis from API...")
 
@@ -1405,6 +1456,8 @@ def jobs_mapped(
 
     except Exception as e:
         print(f"❌ ERROR in jobs_mapped_ultra: {e}")
+        if file_path.exists():
+            file_path.unlink()
         return {"error": str(e)}
 
 
