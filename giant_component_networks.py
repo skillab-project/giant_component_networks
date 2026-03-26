@@ -1190,7 +1190,7 @@ def profiles_mapped(
 
         print(f"💾 Saving results to cache: '{file_path}'...")
         with open(file_path, "w", encoding="utf-8") as json_file:
-            json.dump(result, json_file, indent=4, ensure_ascii=False)
+            json.dump({"status": "completed", "result": result}, json_file, indent=4, ensure_ascii=False)
         print(f"✅ Results cached successfully to '{file_path}'.")
         return result
 
@@ -1450,7 +1450,7 @@ def jobs_mapped(
 
         print(f"💾 Saving results to cache: '{file_path}'...")
         with open(file_path, "w", encoding="utf-8") as json_file:
-            json.dump(result, json_file, indent=4, ensure_ascii=False)
+            json.dump({"status": "completed", "result": result}, json_file, indent=4, ensure_ascii=False)
         print(f"✅ Results cached successfully to '{file_path}'.")
         return result
 
