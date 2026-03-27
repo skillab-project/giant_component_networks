@@ -13,6 +13,8 @@ import os
 import time
 from dotenv import load_dotenv
 import datetime
+import numpy as np
+import traceback
 
 # === Load environment variables ===
 load_dotenv()
